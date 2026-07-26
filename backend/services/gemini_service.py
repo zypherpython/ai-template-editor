@@ -1,7 +1,8 @@
 import json
 import os
-from google import genai
-from google.genai import types
+import subprocess
+import sys
+import tempfile
 from PIL import Image
 import io
 
@@ -9,6 +10,7 @@ from models.schemas import Placeholder
 
 
 PROMPT_PATH = os.path.join(os.path.dirname(__file__), "..", "prompts", "placeholder_prompt.txt")
+BRIDGE_PATH = os.path.join(os.path.dirname(__file__), "gemini_bridge.py")
 MIN_DIMENSION = 100
 
 
@@ -25,38 +27,48 @@ def _image_to_bytes(image: Image.Image) -> bytes:
 
 def analyze_template(image: Image.Image, original_width: int, original_height: int) -> list[Placeholder]:
     if original_width < MIN_DIMENSION or original_height < MIN_DIMENSION:
-        raise ValueError(f"Image too small ({original_width}x{original_height}). Minimum is {MIN_DIMENSION}x{MIN_DIMENSION} pixels")
+        raise ValueError(
+            f"Image too small ({original_width}x{original_height}). Minimum is {MIN_DIMENSION}x{MIN_DIMENSION} pixels"
+        )
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY environment variable is not set")
 
-    client = genai.Client(api_key=api_key)
-
     prompt = _load_prompt()
     image_bytes = _image_to_bytes(image)
 
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as pf:
+        pf.write(prompt)
+        prompt_file = pf.name
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as imgf:
+        imgf.write(image_bytes)
+        image_file = imgf.name
+
     try:
-        response = client.models.generate_content(
-            model="gemini-2.0-flash",
-            contents=[
-                prompt,
-                types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
-            ],
+        result = subprocess.run(
+            [sys.executable, BRIDGE_PATH, prompt_file, image_file],
+            capture_output=True, text=True, timeout=180,
+            env={**os.environ}
         )
-    except Exception as e:
-        raise RuntimeError(f"Gemini API request failed: {str(e)}")
 
-    if not response.text:
-        raise RuntimeError("Gemini returned an empty response (request may have been blocked)")
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "Gemini bridge exited with an error")
 
-    raw = response.text.strip()
-    raw = raw.removeprefix("```json").removeprefix("```").removeprefix("```json\n").removesuffix("```").strip()
+        raw = result.stdout.strip()
+
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Gemini analysis timed out after 180 seconds")
+    finally:
+        os.unlink(prompt_file)
+        os.unlink(image_file)
+
+    raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
 
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
-        raise RuntimeError(f"Gemini returned invalid JSON: {e}. Raw response: {raw[:500]}")
+        raise RuntimeError(f"Gemini returned invalid JSON: {e}. Raw: {raw[:500]}")
 
     placeholders_data = data.get("placeholders", [])
     if not isinstance(placeholders_data, list):

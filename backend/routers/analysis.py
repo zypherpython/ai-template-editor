@@ -1,14 +1,24 @@
+import os
 from fastapi import APIRouter, UploadFile, File, HTTPException
 from PIL import Image
 import io
 
 from models.schemas import AnalysisResponse
-from services.gemini_service import analyze_template
+from services.gemini_service import analyze_template as analyze_gemini
+from detectors.opencv_detector import detect_placeholders as analyze_opencv
 
 router = APIRouter()
 
 MAX_FILE_SIZE = 10 * 1024 * 1024
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp"}
+
+DETECTOR = os.environ.get("DETECTOR", "opencv").lower()
+
+
+def _analyze(image: Image.Image, w: int, h: int):
+    if DETECTOR == "gemini":
+        return analyze_gemini(image, w, h)
+    return analyze_opencv(image)
 
 
 @router.post("/api/analyze-template", response_model=AnalysisResponse)
@@ -34,7 +44,7 @@ async def analyze_template_endpoint(image: UploadFile = File(...)):
     original_width, original_height = pil_image.size
 
     try:
-        placeholders = analyze_template(pil_image, original_width, original_height)
+        placeholders = _analyze(pil_image, original_width, original_height)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
