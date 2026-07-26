@@ -26,24 +26,24 @@ function grayscale(data: Uint8ClampedArray): Uint8Array {
   return gray;
 }
 
-function sobelEdgeStrength(gray: Uint8Array, w: number, h: number): Float32Array {
-  const edges = new Float32Array(gray.length);
+function sobelSeparated(gray: Uint8Array, w: number, h: number): { gx: Float32Array; gy: Float32Array; mag: Float32Array } {
+  const gx = new Float32Array(gray.length);
+  const gy = new Float32Array(gray.length);
+  const mag = new Float32Array(gray.length);
   for (let y = 1; y < h - 1; y++) {
-    const rowAbove = (y - 1) * w;
-    const row = y * w;
-    const rowBelow = (y + 1) * w;
+    const ra = (y - 1) * w, r = y * w, rb = (y + 1) * w;
     for (let x = 1; x < w - 1; x++) {
-      const gx =
-        -gray[rowAbove + x - 1] + gray[rowAbove + x + 1]
-        - 2 * gray[row + x - 1] + 2 * gray[row + x + 1]
-        - gray[rowBelow + x - 1] + gray[rowBelow + x + 1];
-      const gy =
-        -gray[rowAbove + x - 1] - 2 * gray[rowAbove + x] - gray[rowAbove + x + 1]
-        + gray[rowBelow + x - 1] + 2 * gray[rowBelow + x] + gray[rowBelow + x + 1];
-      edges[row + x] = Math.sqrt(gx * gx + gy * gy);
+      gx[r + x] =
+        -gray[ra + x - 1] + gray[ra + x + 1]
+        - 2 * gray[r + x - 1] + 2 * gray[r + x + 1]
+        - gray[rb + x - 1] + gray[rb + x + 1];
+      gy[r + x] =
+        -gray[ra + x - 1] - 2 * gray[ra + x] - gray[ra + x + 1]
+        + gray[rb + x - 1] + 2 * gray[rb + x] + gray[rb + x + 1];
+      mag[r + x] = Math.sqrt(gx[r + x] * gx[r + x] + gy[r + x] * gy[r + x]);
     }
   }
-  return edges;
+  return { gx, gy, mag };
 }
 
 function buildIntegral(data: Float32Array | Uint8Array, w: number, h: number): Float64Array {
@@ -89,6 +89,48 @@ function mergeOverlapping(
   return kept;
 }
 
+function findLines(
+  projection: Float32Array,
+  length: number,
+  threshold: number,
+  minGap: number,
+  minLength: number
+): { start: number; end: number; strength: number }[] {
+  const lines: { start: number; end: number; strength: number }[] = [];
+  let inLine = false;
+  let start = 0;
+  let maxVal = 0;
+  for (let i = 0; i < length; i++) {
+    if (projection[i] >= threshold) {
+      if (!inLine) { start = i; maxVal = 0; inLine = true; }
+      if (projection[i] > maxVal) maxVal = projection[i];
+    } else if (inLine) {
+      if (i - start >= minLength) {
+        lines.push({ start, end: i - 1, strength: maxVal });
+      }
+      inLine = false;
+    }
+  }
+  if (inLine && length - start >= minLength) {
+    lines.push({ start, end: length - 1, strength: maxVal });
+  }
+
+  if (lines.length < 2) return lines;
+
+  const merged: typeof lines = [];
+  let cur = lines[0];
+  for (let i = 1; i < lines.length; i++) {
+    if (lines[i].start - cur.end <= minGap) {
+      cur = { start: cur.start, end: lines[i].end, strength: Math.max(cur.strength, lines[i].strength) };
+    } else {
+      merged.push(cur);
+      cur = lines[i];
+    }
+  }
+  merged.push(cur);
+  return merged;
+}
+
 export function detectPlaceholders(
   imageData: ImageData,
   origW: number,
@@ -98,51 +140,96 @@ export function detectPlaceholders(
   const h = imageData.height;
   const imgArea = w * h;
   const gray = grayscale(imageData.data);
-  const edges = sobelEdgeStrength(gray, w, h);
+  const { gx, gy, mag } = sobelSeparated(gray, w, h);
 
+  const edgeInt = buildIntegral(mag, w, h);
   const grayInt = buildIntegral(gray, w, h);
-  const edgeInt = buildIntegral(edges, w, h);
+
+  const edgeMean = sumRect(edgeInt, w, 0, 0, w, h) / imgArea;
+
+  const hThreshold = edgeMean * 1.5 + 5;
+  const vThreshold = edgeMean * 1.5 + 5;
+
+  const horizProjection = new Float32Array(h);
+  const vertProjection = new Float32Array(w);
+  for (let y = 0; y < h; y++) {
+    let sum = 0;
+    for (let x = 0; x < w; x++) sum += gy[y * w + x];
+    horizProjection[y] = sum / w;
+  }
+  for (let x = 0; x < w; x++) {
+    let sum = 0;
+    for (let y = 0; y < h; y++) sum += gx[y * w + x];
+    vertProjection[x] = sum / h;
+  }
+
+  const minLineLen = Math.round(Math.min(w, h) * 0.04);
+  const gap = Math.round(Math.min(w, h) * 0.02);
+
+  const hLines = findLines(horizProjection, h, hThreshold, gap, minLineLen);
+  const vLines = findLines(vertProjection, w, vThreshold, gap, minLineLen);
 
   const candidates: { x: number; y: number; bw: number; bh: number; score: number }[] = [];
-  const minDim = Math.min(w, h);
 
-  const sizes = [0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.18, 0.22, 0.26, 0.30, 0.35, 0.40];
-  for (const sizeFrac of sizes) {
-    const bw = Math.round(sizeFrac * w);
-    const bh = Math.round(sizeFrac * h);
-    if (bw < 10 || bh < 10) continue;
-    const area = bw * bh;
-    if (area < 0.005 * imgArea || area > 0.5 * imgArea) continue;
+  for (let hi = 0; hi < hLines.length; hi++) {
+    for (let hj = hi + 1; hj < hLines.length; hj++) {
+      for (let vi = 0; vi < vLines.length; vi++) {
+        for (let vj = vi + 1; vj < vLines.length; vj++) {
+          const y1 = hLines[hi].start, y2 = hLines[hj].end;
+          const x1 = vLines[vi].start, x2 = vLines[vj].end;
 
-    const step = Math.max(1, Math.round(Math.min(bw, bh) * 0.15));
-    for (let y = 0; y + bh <= h; y += step) {
-      for (let x = 0; x + bw <= w; x += step) {
-        const perimCount = 2 * (bw + bh);
-        const perimEdge = (
-          sumRect(edgeInt, w, x, y, x + bw, y + 1) +
-          sumRect(edgeInt, w, x, y + bh - 1, x + bw, y + bh) +
-          sumRect(edgeInt, w, x, y, x + 1, y + bh) +
-          sumRect(edgeInt, w, x + bw - 1, y, x + bw, y + bh)
-        ) / perimCount;
+          let bh = y2 - y1 + 1;
+          let bw = x2 - x1 + 1;
+          if (bh < 5 || bw < 5) continue;
+          const area = bw * bh;
+          if (area < 0.005 * imgArea || area > 0.7 * imgArea) continue;
+          const aspect = bw / bh;
+          if (aspect < 0.3 || aspect > 3.5) continue;
 
-        const interiorCount = (bh - 2) * (bw - 2);
-        if (interiorCount <= 0) continue;
-        const avgEdge = sumRect(edgeInt, w, x + 1, y + 1, x + bw - 1, y + bh - 1) / interiorCount;
-        const avgBright = sumRect(grayInt, w, x + 1, y + 1, x + bw - 1, y + bh - 1) / interiorCount;
+          const perimCount = 2 * (bw + bh);
+          const perimEdge = (
+            sumRect(edgeInt, w, x1, y1, x2 + 1, y1 + 1) +
+            sumRect(edgeInt, w, x1, y2, x2 + 1, y2 + 1) +
+            sumRect(edgeInt, w, x1, y1, x1 + 1, y2 + 1) +
+            sumRect(edgeInt, w, x2, y1, x2 + 1, y2 + 1)
+          ) / perimCount;
 
-        const edgeScore = Math.min(1, perimEdge / 80);
-        const brightScore = Math.min(1, avgBright / 200);
-        const interiorEdgeScore = Math.max(0, 1 - avgEdge / 80);
+          const interiorCount = Math.max(1, (bh - 2) * (bw - 2));
+          const avgEdge = sumRect(edgeInt, w, x1 + 1, y1 + 1, x2, y2) / interiorCount;
+          const avgBright = sumRect(grayInt, w, x1 + 1, y1 + 1, x2, y2) / interiorCount;
 
-        const score = edgeScore * 0.4 + brightScore * 0.3 + interiorEdgeScore * 0.3;
-        if (score > 0.45) {
-          candidates.push({
-            x: x * origW / w,
-            y: y * origH / h,
-            bw: bw * origW / w,
-            bh: bh * origH / h,
-            score,
-          });
+          const borderOutsideCount = 2 * ((bw + 4) + (bh + 4));
+          let borderOutside = 0;
+          const ox1 = Math.max(0, x1 - 2), oy1 = Math.max(0, y1 - 2);
+          const ox2 = Math.min(w, x2 + 3), oy2 = Math.min(h, y2 + 3);
+          const outW = ox2 - ox1, outH = oy2 - oy1;
+          if (outW > bw + 2 && outH > bh + 2) {
+            const outArea = outW * outH;
+            const innerArea = (Math.min(x2, ox2 - 1) - Math.max(x1, ox1) + 1) * (Math.min(y2, oy2 - 1) - Math.max(y1, oy1) + 1);
+            if (outArea > innerArea) {
+              const outSum = sumRect(grayInt, w, ox1, oy1, ox2, oy2);
+              const innerSum = sumRect(grayInt, w, Math.max(x1, ox1), Math.max(y1, oy1), Math.min(x2, ox2 - 1) + 1, Math.min(y2, oy2 - 1) + 1);
+              borderOutside = (outSum - innerSum) / (outArea - innerArea);
+            }
+          }
+          const borderContrast = borderOutside > 0 ? Math.abs(avgBright - borderOutside) / Math.max(avgBright, borderOutside, 1) : 0;
+
+          const hEdge = hLines[hi].strength > hLines[hj].strength ? hLines[hi].strength : hLines[hj].strength;
+          const vEdge = vLines[vi].strength > vLines[vj].strength ? vLines[vi].strength : vLines[vj].strength;
+
+          const edgeScore = Math.min(1, perimEdge / 100) * Math.min(1, hEdge / 40) * Math.min(1, vEdge / 40);
+          const brightScore = avgBright > 100 ? Math.min(1, avgBright / 220) : 0;
+          const interiorScore = Math.max(0, 1 - avgEdge / 100);
+          const contrastScore = Math.min(1, borderContrast * 4);
+
+          const score = edgeScore * 0.30 + brightScore * 0.25 + interiorScore * 0.20 + contrastScore * 0.25;
+          if (score > 0.30) {
+            candidates.push({
+              x: x1 * origW / w, y: y1 * origH / h,
+              bw: bw * origW / w, bh: bh * origH / h,
+              score,
+            });
+          }
         }
       }
     }
