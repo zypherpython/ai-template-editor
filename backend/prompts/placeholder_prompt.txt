@@ -1,0 +1,31 @@
+Analyze this design template.
+
+Detect every region intended to be replaced with a user image, including:
+- Photo frames
+- Profile picture placeholders
+- Logo placeholders
+- Image boxes
+
+Ignore:
+- Text
+- Decorative graphics
+- Icons
+- Backgrounds
+- Borders
+- Shadows
+
+Return ONLY valid JSON. Do not include markdown code fences or any other text.
+
+The JSON must be an object with a single key "placeholders" containing an array of objects. Each object must have these fields:
+- id: a unique string like "placeholder_1", "placeholder_2", etc.
+- label: a short human-readable label describing what the placeholder is for
+- type: always "image"
+- shape: either "rectangle" or "circle"
+- confidence: a float between 0 and 1 indicating how confident you are this is a placeholder
+- rotation: rotation in degrees (usually 0)
+- x: normalized x coordinate of the top-left corner (0 to 1)
+- y: normalized y coordinate of the top-left corner (0 to 1)
+- width: normalized width of the bounding box (0 to 1)
+- height: normalized height of the bounding box (0 to 1)
+
+All coordinates must be normalized between 0 and 1 relative to the image dimensions.
