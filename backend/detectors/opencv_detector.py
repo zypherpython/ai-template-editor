@@ -1,7 +1,6 @@
 import cv2
 import numpy as np
 from PIL import Image
-import io
 
 from models.schemas import Placeholder
 
@@ -15,44 +14,124 @@ def _pil_to_cv2(image: Image.Image) -> np.ndarray:
     return arr
 
 
-def detect_rectangles(gray: np.ndarray, img_area: int) -> list[Placeholder]:
-    h, w = gray.shape
-    placeholders = []
+def _iou(a, b):
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    xi1, yi1 = max(ax1, bx1), max(ay1, by1)
+    xi2, yi2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0, xi2 - xi1) * max(0, yi2 - yi1)
+    u = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter
+    return inter / u if u > 0 else 0
 
-    edges = cv2.Canny(gray, 30, 100)
+
+def _nms(rects, iou_thresh=0.4):
+    rects = sorted(rects, key=lambda r: r[-1], reverse=True)
+    keep = []
+    while rects:
+        best = rects.pop(0)
+        keep.append(best)
+        rects = [r for r in rects if _iou(best[:4], r[:4]) < iou_thresh]
+    return keep
+
+
+def detect_placeholders(image: Image.Image) -> list[Placeholder]:
+    img = _pil_to_cv2(image)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    h, w = img.shape[:2]
+    img_area = h * w
+    candidates = []
+
+    # Strategy 1: edge-based rectangle detection
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edge = cv2.Canny(blur, 30, 100)
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    dilated = cv2.dilate(edges, kernel, iterations=1)
+    closed = cv2.morphologyEx(edge, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    for i, cnt in enumerate(contours):
-        epsilon = 0.02 * cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, epsilon, True)
-
-        if len(approx) != 4:
-            continue
-
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < 0.005 * img_area or area > 0.6 * img_area:
+        if area < 0.008 * img_area or area > 0.5 * img_area:
             continue
 
         x, y, bw, bh = cv2.boundingRect(cnt)
-
         aspect = bw / bh if bh > 0 else 0
-        if aspect < 0.3 or aspect > 3.0:
+        if aspect < 0.4 or aspect > 2.5:
             continue
 
         rect_area = bw * bh
-        fill_ratio = area / rect_area if rect_area > 0 else 0
-        if fill_ratio < 0.3:
+        fill = area / rect_area if rect_area > 0 else 0
+        if fill < 0.35:
             continue
 
-        placeholders.append(Placeholder(
-            id=f"placeholder_{len(placeholders) + 1}",
-            label="Image Placeholder",
+        roi = gray[max(0, y):min(h, y + bh), max(0, x):min(w, x + bw)]
+        if roi.size == 0:
+            continue
+
+        mean_b = roi.mean()
+        std_b = roi.std()
+        if mean_b < 40 or std_b > 80:
+            continue
+
+        candidates.append((x, y, bw, bh, 0.8))
+
+    # Strategy 2: adaptive threshold for light regions
+    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5)
+    inv = cv2.bitwise_not(thresh)
+    kernel2 = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    cleaned = cv2.morphologyEx(inv, cv2.MORPH_CLOSE, kernel2)
+
+    contours2, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for cnt in contours2:
+        area = cv2.contourArea(cnt)
+        if area < 0.02 * img_area or area > 0.5 * img_area:
+            continue
+
+        x, y, bw, bh = cv2.boundingRect(cnt)
+        aspect = bw / bh if bh > 0 else 0
+        if aspect < 0.4 or aspect > 2.5:
+            continue
+
+        rect_area = bw * bh
+        fill = area / rect_area if rect_area > 0 else 0
+        if fill < 0.5:
+            continue
+
+        roi = gray[max(0, y):min(h, y + bh), max(0, x):min(w, x + bw)]
+        if roi.size == 0:
+            continue
+
+        mean_b = roi.mean()
+        std_b = roi.std()
+        if mean_b < 60 or std_b > 80:
+            continue
+
+        candidates.append((x, y, bw, bh, 0.7))
+
+    if not candidates:
+        return []
+
+    nms_input = [(x, y, x + bw, y + bh, c) for x, y, bw, bh, c in candidates]
+    kept = _nms(nms_input)
+
+    seen = set()
+    result = []
+    for x, y, x2, y2, conf in kept:
+        bw = x2 - x
+        bh = y2 - y
+        key = (round(x / w, 1), round(y / h, 1))
+        if key in seen:
+            continue
+        seen.add(key)
+
+        shape = "rectangle"
+        label = "Image Placeholder"
+
+        result.append(Placeholder(
+            id=f"placeholder_{len(result) + 1}",
+            label=label,
             type="image",
-            shape="rectangle",
-            confidence=min(1.0, fill_ratio),
+            shape=shape,
+            confidence=round(min(1.0, conf), 2),
             rotation=0,
             x=round(x / w, 4),
             y=round(y / h, 4),
@@ -60,62 +139,4 @@ def detect_rectangles(gray: np.ndarray, img_area: int) -> list[Placeholder]:
             height=round(bh / h, 4),
         ))
 
-    return placeholders
-
-
-def detect_circles(gray: np.ndarray, img_area: int) -> list[Placeholder]:
-    h, w = gray.shape
-    placeholders = []
-
-    blurred = cv2.medianBlur(gray, 5)
-    circles = cv2.HoughCircles(
-        blurred, cv2.HOUGH_GRADIENT, dp=1.2, minDist=int(h * 0.1),
-        param1=50, param2=30, minRadius=int(min(h, w) * 0.03),
-        maxRadius=int(min(h, w) * 0.4)
-    )
-
-    if circles is not None:
-        circles = np.round(circles[0, :]).astype(int)
-        for i, (cx, cy, r) in enumerate(circles):
-            circle_area = np.pi * r * r
-            if circle_area < 0.005 * img_area or circle_area > 0.5 * img_area:
-                continue
-
-            x = max(0, cx - r)
-            y = max(0, cy - r)
-            bw = min(2 * r, w - x)
-            bh = min(2 * r, h - y)
-
-            placeholders.append(Placeholder(
-                id=f"placeholder_{len(placeholders) + 1}",
-                label="Profile Picture",
-                type="image",
-                shape="circle",
-                confidence=0.85,
-                rotation=0,
-                x=round(x / w, 4),
-                y=round(y / h, 4),
-                width=round(bw / w, 4),
-                height=round(bh / h, 4),
-            ))
-
-    return placeholders
-
-
-def detect_placeholders(image: Image.Image) -> list[Placeholder]:
-    img = _pil_to_cv2(image)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    img_area = img.shape[0] * img.shape[1]
-
-    rects = detect_rectangles(gray, img_area)
-    circles = detect_circles(gray, img_area)
-
-    seen = set()
-    combined = []
-    for p in rects + circles:
-        key = (round(p.x, 2), round(p.y, 2), round(p.width, 2), round(p.height, 2))
-        if key not in seen:
-            seen.add(key)
-            combined.append(p)
-
-    return combined
+    return result
