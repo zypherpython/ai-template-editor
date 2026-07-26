@@ -1,8 +1,9 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useRef } from "react";
 import ImageUploader from "@/components/ImageUploader";
 import PlaceholderOverlay from "@/components/PlaceholderOverlay";
+import { detectPlaceholders } from "@/components/clientDetector";
 
 interface Placeholder {
   id: string;
@@ -23,12 +24,34 @@ interface AnalysisResult {
   template_height: number;
 }
 
+function loadImage(file: File): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+function runClientDetection(img: HTMLImageElement): AnalysisResult {
+  const canvas = document.createElement("canvas");
+  const maxDim = 400;
+  const scale = Math.min(maxDim / img.naturalWidth, maxDim / img.naturalHeight, 1);
+  canvas.width = Math.round(img.naturalWidth * scale);
+  canvas.height = Math.round(img.naturalHeight * scale);
+  const ctx = canvas.getContext("2d")!;
+  ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+  const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  return detectPlaceholders(imageData, img.naturalWidth, img.naturalHeight);
+}
+
 export default function Home() {
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<AnalysisResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [filledImages, setFilledImages] = useState<Record<string, string>>({});
+  const [detector, setDetector] = useState<"api" | "browser">("api");
 
   const handleImageSelect = async (file: File) => {
     setError(null);
@@ -52,9 +75,13 @@ export default function Home() {
       }
 
       const data: AnalysisResult = await res.json();
+      setDetector("api");
       setAnalysis(data);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Something went wrong");
+    } catch {
+      const img = await loadImage(file);
+      const data = runClientDetection(img);
+      setDetector("browser");
+      setAnalysis(data);
     } finally {
       setLoading(false);
     }
@@ -127,7 +154,7 @@ export default function Home() {
         <ImageUploader onImageSelect={handleImageSelect} disabled={loading} />
       </div>
 
-      {loading && <p className="text-gray-500">Analyzing template with AI...</p>}
+      {loading && <p className="text-gray-500">Analyzing template...</p>}
 
       {error && (
         <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg p-4 w-full max-w-2xl">
@@ -143,6 +170,9 @@ export default function Home() {
 
       {analysis && imageUrl && analysis.placeholders.length > 0 && (
         <div className="flex flex-col items-center gap-6 w-full">
+          <div className="text-xs text-gray-400 self-start">
+            Detected via {detector === "api" ? "backend AI" : "browser (offline)"}
+          </div>
           <PlaceholderOverlay
             imageUrl={imageUrl}
             placeholders={analysis.placeholders}
