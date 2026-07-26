@@ -21,7 +21,7 @@ function grayscale(data: Uint8ClampedArray): Uint8Array {
   const gray = new Uint8Array(data.length / 4);
   for (let i = 0; i < gray.length; i++) {
     const j = i * 4;
-    gray[i] = 0.299 * data[j] + 0.587 * data[j + 1] + 0.114 * data[j + 2];
+    gray[i] = (76 * data[j] + 150 * data[j + 1] + 29 * data[j + 2]) >> 8;
   }
   return gray;
 }
@@ -29,19 +29,64 @@ function grayscale(data: Uint8ClampedArray): Uint8Array {
 function sobelEdgeStrength(gray: Uint8Array, w: number, h: number): Float32Array {
   const edges = new Float32Array(gray.length);
   for (let y = 1; y < h - 1; y++) {
+    const rowAbove = (y - 1) * w;
+    const row = y * w;
+    const rowBelow = (y + 1) * w;
     for (let x = 1; x < w - 1; x++) {
-      const i = y * w + x;
       const gx =
-        -gray[i - w - 1] + gray[i - w + 1]
-        - 2 * gray[i - 1] + 2 * gray[i + 1]
-        - gray[i + w - 1] + gray[i + w + 1];
+        -gray[rowAbove + x - 1] + gray[rowAbove + x + 1]
+        - 2 * gray[row + x - 1] + 2 * gray[row + x + 1]
+        - gray[rowBelow + x - 1] + gray[rowBelow + x + 1];
       const gy =
-        -gray[i - w - 1] - 2 * gray[i - w] - gray[i - w + 1]
-        + gray[i + w - 1] + 2 * gray[i + w] + gray[i + w + 1];
-      edges[i] = Math.sqrt(gx * gx + gy * gy);
+        -gray[rowAbove + x - 1] - 2 * gray[rowAbove + x] - gray[rowAbove + x + 1]
+        + gray[rowBelow + x - 1] + 2 * gray[rowBelow + x] + gray[rowBelow + x + 1];
+      edges[row + x] = Math.sqrt(gx * gx + gy * gy);
     }
   }
   return edges;
+}
+
+function buildIntegral(data: Float32Array | Uint8Array, w: number, h: number): Float64Array {
+  const integral = new Float64Array((w + 1) * (h + 1));
+  for (let y = 0; y < h; y++) {
+    const rowOut = (y + 1) * (w + 1) + 1;
+    const rowIn = y * w;
+    const rowAbove = y * (w + 1) + 1;
+    for (let x = 0; x < w; x++) {
+      integral[rowOut + x] = data[rowIn + x] + integral[rowAbove + x] + integral[rowOut + x - 1] - integral[rowAbove + x - 1];
+    }
+  }
+  return integral;
+}
+
+function sumRect(integral: Float64Array, w: number, x1: number, y1: number, x2: number, y2: number): number {
+  const stride = w + 1;
+  return integral[y2 * stride + x2] - integral[y1 * stride + x2] - integral[y2 * stride + x1] + integral[y1 * stride + x1];
+}
+
+function mergeOverlapping(
+  rects: { x: number; y: number; bw: number; bh: number; score: number }[]
+): { x: number; y: number; bw: number; bh: number; score: number }[] {
+  if (rects.length === 0) return [];
+  function iou(a: typeof rects[0], b: typeof rects[0]) {
+    const xi1 = Math.max(a.x, b.x);
+    const yi1 = Math.max(a.y, b.y);
+    const xi2 = Math.min(a.x + a.bw, b.x + b.bw);
+    const yi2 = Math.min(a.y + a.bh, b.y + b.bh);
+    const inter = Math.max(0, xi2 - xi1) * Math.max(0, yi2 - yi1);
+    const u = a.bw * a.bh + b.bw * b.bh - inter;
+    return u > 0 ? inter / u : 0;
+  }
+  const sorted = [...rects].sort((a, b) => b.score - a.score);
+  const kept: typeof rects = [];
+  for (const r of sorted) {
+    let overlap = false;
+    for (const k of kept) {
+      if (iou(r, k) > 0.3) { overlap = true; break; }
+    }
+    if (!overlap) kept.push(r);
+  }
+  return kept;
 }
 
 export function detectPlaceholders(
@@ -51,85 +96,60 @@ export function detectPlaceholders(
 ): AnalysisResult {
   const w = imageData.width;
   const h = imageData.height;
-  const scaleX = origW / w;
-  const scaleY = origH / h;
   const imgArea = w * h;
   const gray = grayscale(imageData.data);
   const edges = sobelEdgeStrength(gray, w, h);
 
+  const grayInt = buildIntegral(gray, w, h);
+  const edgeInt = buildIntegral(edges, w, h);
+
   const candidates: { x: number; y: number; bw: number; bh: number; score: number }[] = [];
-  const step = Math.max(1, Math.floor(Math.min(w, h) / 100));
-  const minArea = 0.01 * imgArea;
-  const maxArea = 0.5 * imgArea;
+  const minDim = Math.min(w, h);
 
-  for (let y = 0; y < h - step; y += step) {
-    for (let x = 0; x < w - step; x += step) {
-      let maxBw = 0, maxBh = 0;
-      for (let bw = step; x + bw <= w && bw < w * 0.5; bw += step) {
-        for (let bh = step; y + bh <= h && bh < h * 0.5; bh += step) {
-          const area = bw * bh;
-          if (area < minArea || area > maxArea) continue;
+  const sizes = [0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.18, 0.22, 0.26, 0.30, 0.35, 0.40];
+  for (const sizeFrac of sizes) {
+    const bw = Math.round(sizeFrac * w);
+    const bh = Math.round(sizeFrac * h);
+    if (bw < 10 || bh < 10) continue;
+    const area = bw * bh;
+    if (area < 0.005 * imgArea || area > 0.5 * imgArea) continue;
 
-          const aspect = bw / bh;
-          if (aspect < 0.4 || aspect > 2.5) continue;
+    const step = Math.max(1, Math.round(Math.min(bw, bh) * 0.15));
+    for (let y = 0; y + bh <= h; y += step) {
+      for (let x = 0; x + bw <= w; x += step) {
+        const perimCount = 2 * (bw + bh);
+        const perimEdge = (
+          sumRect(edgeInt, w, x, y, x + bw, y + 1) +
+          sumRect(edgeInt, w, x, y + bh - 1, x + bw, y + bh) +
+          sumRect(edgeInt, w, x, y, x + 1, y + bh) +
+          sumRect(edgeInt, w, x + bw - 1, y, x + bw, y + bh)
+        ) / perimCount;
 
-          let edgeSum = 0, edgeCount = 0;
-          for (let py = y; py < y + bh; py++) {
-            for (let px = x; px < x + bw; px++) {
-              edgeSum += edges[py * w + px];
-              edgeCount++;
-            }
-          }
-          const avgEdge = edgeSum / edgeCount;
+        const interiorCount = (bh - 2) * (bw - 2);
+        if (interiorCount <= 0) continue;
+        const avgEdge = sumRect(edgeInt, w, x + 1, y + 1, x + bw - 1, y + bh - 1) / interiorCount;
+        const avgBright = sumRect(grayInt, w, x + 1, y + 1, x + bw - 1, y + bh - 1) / interiorCount;
 
-          let interiorSum = 0, interiorCount = 0;
-          for (let py = y + step; py < y + bh - step; py++) {
-            for (let px = x + step; px < x + bw - step; px++) {
-              interiorSum += gray[py * w + px];
-              interiorCount++;
-            }
-          }
-          const avgBright = interiorCount > 0 ? interiorSum / interiorCount : 0;
+        const edgeScore = Math.min(1, perimEdge / 80);
+        const brightScore = Math.min(1, avgBright / 200);
+        const interiorEdgeScore = Math.max(0, 1 - avgEdge / 80);
 
-          let perimSum = 0, perimCount = 0;
-          for (let px = x; px < x + bw; px++) {
-            perimSum += edges[y * w + px] + edges[(y + bh - 1) * w + px];
-            perimCount += 2;
-          }
-          for (let py = y; py < y + bh; py++) {
-            perimSum += edges[py * w + x] + edges[py * w + (x + bw - 1)];
-            perimCount += 2;
-          }
-          const perimEdge = perimSum / perimCount;
-
-          const edgeScore = Math.min(1, perimEdge / 60);
-          const brightScore = Math.min(1, avgBright / 200);
-          const interiorEdgeScore = Math.max(0, 1 - avgEdge / 80);
-
-          const score = edgeScore * 0.4 + brightScore * 0.3 + interiorEdgeScore * 0.3;
-          if (score > 0.5 && bw > bh * 0.5 && bh > bw * 0.5) {
-            if (bw > maxBw || bh > maxBh) {
-              maxBw = bw;
-              maxBh = bh;
-            }
-          }
+        const score = edgeScore * 0.4 + brightScore * 0.3 + interiorEdgeScore * 0.3;
+        if (score > 0.45) {
+          candidates.push({
+            x: x * origW / w,
+            y: y * origH / h,
+            bw: bw * origW / w,
+            bh: bh * origH / h,
+            score,
+          });
         }
-      }
-      if (maxBw > 0) {
-        candidates.push({
-          x: x * scaleX,
-          y: y * scaleY,
-          bw: maxBw * scaleX,
-          bh: maxBh * scaleY,
-          score: 1,
-        });
       }
     }
   }
 
   const merged = mergeOverlapping(candidates);
-  const sorted = merged.sort((a, b) => b.score - a.score);
-  const top = sorted.slice(0, 8);
+  const top = merged.sort((a, b) => b.score - a.score).slice(0, 10);
 
   return {
     placeholders: top.map((c, i) => ({
@@ -147,36 +167,4 @@ export function detectPlaceholders(
     template_width: origW,
     template_height: origH,
   };
-}
-
-function mergeOverlapping(
-  rects: { x: number; y: number; bw: number; bh: number; score: number }[]
-): { x: number; y: number; bw: number; bh: number; score: number }[] {
-  if (rects.length === 0) return [];
-
-  function iou(a: typeof rects[0], b: typeof rects[0]) {
-    const xi1 = Math.max(a.x, b.x);
-    const yi1 = Math.max(a.y, b.y);
-    const xi2 = Math.min(a.x + a.bw, b.x + b.bw);
-    const yi2 = Math.min(a.y + a.bh, b.y + b.bh);
-    const inter = Math.max(0, xi2 - xi1) * Math.max(0, yi2 - yi1);
-    const u = a.bw * a.bh + b.bw * b.bh - inter;
-    return u > 0 ? inter / u : 0;
-  }
-
-  const sorted = [...rects].sort((a, b) => b.score - a.score);
-  const kept: typeof rects = [];
-
-  for (const r of sorted) {
-    let overlap = false;
-    for (const k of kept) {
-      if (iou(r, k) > 0.3) {
-        overlap = true;
-        break;
-      }
-    }
-    if (!overlap) kept.push(r);
-  }
-
-  return kept;
 }
